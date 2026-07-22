@@ -27,14 +27,15 @@ import (
 	"github.com/uber/tango/config"
 	"github.com/uber/tango/core/bazel"
 	"github.com/uber/tango/core/cachekey"
-	"github.com/uber/tango/core/common"
 	"github.com/uber/tango/core/git"
 	"github.com/uber/tango/core/repomanager"
 	"github.com/uber/tango/core/storage"
 	"github.com/uber/tango/core/workspace"
 	"github.com/uber/tango/entity"
 	"github.com/uber/tango/graphrunner"
+	"github.com/uber/tango/internal/streaming"
 	"github.com/uber/tango/internal/url"
+	"github.com/uber/tango/mapper"
 	"github.com/uber/tango/observability/metrics"
 	"go.uber.org/zap"
 )
@@ -212,15 +213,34 @@ func (b *nativeOrchestrator) GetTargetGraph(ctx context.Context, req entity.GetT
 	if err != nil {
 		return nil, fmt.Errorf("compute target graph: %w", err)
 	}
-	responses, err := common.ResultToGetTargetGraphResponse(ctx, result,
-		b.config.Service.Chunking.TargetChunkSize,
-		b.config.Service.Chunking.MetadataMapChunkSize,
+	targets, meta, err := mapper.ResultToTargetGraph(ctx, result)
+	if err != nil {
+		return nil, fmt.Errorf("convert target graph: %w", err)
+	}
+	targetGroups, err := streaming.SplitBySize(targets, b.config.Service.MaxMessageBytes)
+	if err != nil {
+		return nil, fmt.Errorf("split target graph: %w", err)
+	}
+	chunks := make([]entity.GetTargetGraphResponse, 0, len(targetGroups))
+	for _, g := range targetGroups {
+		chunks = append(chunks, entity.GetTargetGraphResponse{Targets: g})
+	}
+	metaGroups, err := streaming.SplitMetadata(
+		meta.TargetIDMapping,
+		meta.RuleTypeMapping,
+		meta.TagMapping,
+		meta.AttributeNameMapping,
+		meta.AttributeStringValueMapping,
+		b.config.Service.MaxMessageBytes,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("convert target graph to response: %w", err)
+		return nil, fmt.Errorf("split target graph metadata: %w", err)
+	}
+	for _, m := range metaGroups {
+		chunks = append(chunks, entity.GetTargetGraphResponse{Metadata: m})
 	}
 	cacheWriteStart := time.Now()
-	err = storage.WriteGraphStream(ctx, b.storage, treehashPath, responses)
+	err = storage.WriteGraphStream(ctx, b.storage, treehashPath, chunks)
 	if err != nil {
 		return nil, fmt.Errorf("write graph to storage at %s: %w", treehashPath, err)
 	}
