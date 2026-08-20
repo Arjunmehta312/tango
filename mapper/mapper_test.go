@@ -19,6 +19,27 @@ func TestResultToTargetGraph_EmptyResult(t *testing.T) {
 	assert.NotNil(t, meta)
 }
 
+func TestResultToTargetGraph_PropagatesAllTargetsFileHashes(t *testing.T) {
+	t.Parallel()
+
+	hashes := map[string]string{".bazelrc": "abc123", "tools/bazel": "def456"}
+	result := targethasher.Result{
+		AllTargetsFileHashes: hashes,
+	}
+
+	_, meta, err := ResultToTargetGraph(t.Context(), result)
+	require.NoError(t, err)
+	assert.Equal(t, hashes, meta.AllTargetsFileHashes)
+}
+
+func TestResultToTargetGraph_NilAllTargetsFileHashes(t *testing.T) {
+	t.Parallel()
+
+	_, meta, err := ResultToTargetGraph(t.Context(), targethasher.Result{})
+	require.NoError(t, err)
+	assert.Nil(t, meta.AllTargetsFileHashes)
+}
+
 func TestResultToGraphChunks(t *testing.T) {
 	t.Parallel()
 
@@ -73,5 +94,23 @@ func TestResultToGraphChunks(t *testing.T) {
 
 		_, err := ResultToGraphChunks(ctx, result, 1<<20)
 		require.Error(t, err)
+	})
+
+	t.Run("propagates AllTargetsFileHashes into a metadata chunk", func(t *testing.T) {
+		t.Parallel()
+
+		hashes := map[string]string{".bazelrc": "abc123"}
+		result := targethasher.Result{AllTargetsFileHashes: hashes}
+
+		chunks, err := ResultToGraphChunks(t.Context(), result, 1<<20)
+		require.NoError(t, err)
+
+		var got map[string]string
+		for _, c := range chunks {
+			if c.Metadata != nil && len(c.Metadata.AllTargetsFileHashes) > 0 {
+				got = c.Metadata.AllTargetsFileHashes
+			}
+		}
+		assert.Equal(t, hashes, got)
 	})
 }

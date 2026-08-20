@@ -16,6 +16,7 @@ package targethasher
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -70,6 +71,9 @@ type HashConfig struct {
 	SequentialHashTargets []string
 	ExcludedRegex         []string
 	UseBzlmod             bool
+	// AllTargetsFiles lists repo-relative paths whose hashes should be
+	// extracted from KnownSourceHashes into Result.AllTargetsFileHashes.
+	AllTargetsFiles []string
 }
 
 // Target contains information about the hash for a single target
@@ -113,6 +117,13 @@ type Result struct {
 	//
 	//		For more info see https://docs.bazel.build/versions/master/build-ref.html#label_directory.
 	Warnings map[string]error
+
+	// AllTargetsFileHashes maps repo-relative file paths to their
+	// hex-encoded content hashes for files listed in
+	// RepositoryConfig.AllTargetsFiles. Populated from git ls-tree during
+	// graph computation; nil when the repository has no AllTargetsFiles
+	// configured.
+	AllTargetsFileHashes map[string]string
 }
 
 // EmptyResult returns a result for no targets.
@@ -138,10 +149,25 @@ func FromProto(ctx context.Context, r *buildpb.QueryResult, workspaceroot string
 		excludedRegex = append(excludedRegex, re)
 	}
 
-	return fromProto(ctx, r, &diskHashHelper{
+	result, err := fromProto(ctx, r, &diskHashHelper{
 		workspaceroot:   workspaceroot,
 		knownFileHashes: hashConfig.KnownSourceHashes,
 	}, workspaceroot, fullHashRepos, set.NewSet(hashConfig.SequentialHashTargets...), excludedRegex, hashConfig.UseBzlmod)
+	if err != nil {
+		return result, err
+	}
+
+	if len(hashConfig.AllTargetsFiles) > 0 && len(hashConfig.KnownSourceHashes) > 0 {
+		atfh := make(map[string]string, len(hashConfig.AllTargetsFiles))
+		for _, f := range hashConfig.AllTargetsFiles {
+			if h, ok := hashConfig.KnownSourceHashes[f]; ok {
+				atfh[f] = hex.EncodeToString(h)
+			}
+		}
+		result.AllTargetsFileHashes = atfh
+	}
+
+	return result, nil
 }
 
 // FromProtoNoHash calculates a DAG graph based on a query result. It does not calculate hashes for targets.

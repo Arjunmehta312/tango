@@ -97,6 +97,7 @@ func (g *nativeGraphRunner) Compute(ctx context.Context, ws workspace.Workspace)
 		FullHashRepos:     g.config.FullHashRepos,
 		ExcludedRegex:     append(g.config.ExcludedFiles, g.extraExcludedFiles...),
 		UseBzlmod:         bzlmodEnabled,
+		AllTargetsFiles:   g.config.AllTargetsFiles,
 	}
 
 	hashStart := time.Now()
