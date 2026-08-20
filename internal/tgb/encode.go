@@ -736,6 +736,10 @@ func (e *encoder) write(w io.Writer) error {
 		{colBlockStart, codecZstd, blockStartRaw},
 	}
 
+	if len(e.g.Metadata.AllTargetsFileHashes) > 0 {
+		rawCols = append(rawCols, rawCol{colAllTargetsFileHashes, codecZstd, encodeStringMap(e.g.Metadata.AllTargetsFileHashes)})
+	}
+
 	// Compress zstd columns (optionally parallel).
 	type compressedCol struct {
 		id    uint64
@@ -827,6 +831,27 @@ func (e *encoder) write(w io.Writer) error {
 		return err
 	}
 	return nil
+}
+
+// encodeStringMap serializes a map[string]string as a length-prefixed sequence
+// of (key, value) pairs: count (uvarint), then for each pair the key length
+// (uvarint), key bytes, value length (uvarint), value bytes.
+func encodeStringMap(m map[string]string) []byte {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	var buf []byte
+	buf = binary.AppendUvarint(buf, uint64(len(m)))
+	for _, k := range keys {
+		buf = binary.AppendUvarint(buf, uint64(len(k)))
+		buf = append(buf, k...)
+		buf = binary.AppendUvarint(buf, uint64(len(m[k])))
+		buf = append(buf, m[k]...)
+	}
+	return buf
 }
 
 // TruncateHashes returns a new Graph with each target's Hash field truncated
