@@ -76,6 +76,7 @@ type job struct {
 	completed bool
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
+	treehash  string
 }
 
 // GetChangedTargets returns the changed targets between two revisions. If the
@@ -113,9 +114,16 @@ func (c *controller) GetChangedTargets(request *pb.GetChangedTargetsRequest, str
 		maxDist = request.GetOutputConfig().GetMaxDistance()
 	}
 
+	// Read treehashes once for the entire request. These are passed through
+	// the request pipeline to avoid redundant storage reads.
+	treehash1, treehash2, err := readTreehashParallel(ctx, c.storage, request.GetFirstRevision(), request.GetSecondRevision(), e, opGetChangedTargets)
+	if err != nil {
+		return fmt.Errorf("read revision treehash: %w", err)
+	}
+
 	// Fast path: stream a previously computed result straight from cache.
 	if !request.GetBypassCache() {
-		served, err := c.serveChangedTargetsFromCache(ctx, e, logger, request, stream, maxDist, start)
+		served, err := c.serveChangedTargetsFromCache(ctx, e, logger, request, stream, maxDist, start, treehash1, treehash2)
 		if err != nil {
 			return fmt.Errorf("serve from cache: %w", err)
 		}
@@ -125,7 +133,7 @@ func (c *controller) GetChangedTargets(request *pb.GetChangedTargetsRequest, str
 	}
 
 	// Fetch both revisions' target graphs concurrently.
-	firstGraph, secondGraph, err := c.fetchTargetGraphs(ctx, e, logger, request)
+	firstGraph, secondGraph, err := c.fetchTargetGraphs(ctx, e, logger, request, treehash1, treehash2)
 	if err != nil {
 		return fmt.Errorf("fetch target graphs: %w", err)
 	}
@@ -142,7 +150,7 @@ func (c *controller) GetChangedTargets(request *pb.GetChangedTargetsRequest, str
 	}
 
 	// Cache the computed result concurrently so it doesn't block the stream send.
-	c.cacheComparedTargets(logger, request, changedTargetsResponses)
+	c.cacheComparedTargets(logger, request, changedTargetsResponses, treehash1, treehash2)
 
 	sendStart := time.Now()
 	if err := sendTrimmedChangedTargets(stream, changedTargetsResponses, maxDist, request.GetOutputConfig()); err != nil {
@@ -164,15 +172,18 @@ func (c *controller) GetChangedTargets(request *pb.GetChangedTargetsRequest, str
 //   - (false, nil) on a cache miss or a corrupt blob — the caller should recompute;
 //   - (false, err) on an infra failure or a client disconnect that aborts the request.
 //
-// readTreehash returns ("", nil) on a cache miss (skip cache, recompute) but any
-// real storage error surfaces here so an infra failure that disables the cache
-// (e.g. a missing-deadline "missing TTL" reject) becomes a visible request failure
-// rather than silent degradation.
-func (c *controller) serveChangedTargetsFromCache(ctx context.Context, e *metrics.Emitter, logger *zap.Logger, request *pb.GetChangedTargetsRequest, stream pb.TangoServiceGetChangedTargetsYARPCServer, maxDist int32, start time.Time) (bool, error) {
+// If treehash1 and treehash2 are provided (non-empty), they are used instead of
+// reading from storage. This allows the caller to reuse treehash values already
+// read earlier in the request.
+func (c *controller) serveChangedTargetsFromCache(ctx context.Context, e *metrics.Emitter, logger *zap.Logger, request *pb.GetChangedTargetsRequest, stream pb.TangoServiceGetChangedTargetsYARPCServer, maxDist int32, start time.Time, treehash1, treehash2 string) (bool, error) {
 	cacheStart := time.Now()
-	treehash1, treehash2, err := readTreehashParallel(ctx, c.storage, request.GetFirstRevision(), request.GetSecondRevision(), e, opGetChangedTargets)
-	if err != nil {
-		return false, fmt.Errorf("read revision treehash: %w", err)
+	if treehash1 == "" || treehash2 == "" {
+		// Treehashes not provided by caller; read them now.
+		var err error
+		treehash1, treehash2, err = readTreehashParallel(ctx, c.storage, request.GetFirstRevision(), request.GetSecondRevision(), e, opGetChangedTargets)
+		if err != nil {
+			return false, fmt.Errorf("read revision treehash: %w", err)
+		}
 	}
 	if treehash1 == "" || treehash2 == "" {
 		return false, nil
@@ -241,13 +252,17 @@ func (c *controller) serveChangedTargetsFromCache(ctx context.Context, e *metric
 // original failure is returned. A client disconnect surfaces as a user-cancelled
 // error. A graph stored as a TGB blob comes back as its undrained reader; a
 // gob-era graph is drained into chunks here, inside the concurrent fetch.
-func (c *controller) fetchTargetGraphs(ctx context.Context, e *metrics.Emitter, logger *zap.Logger, request *pb.GetChangedTargetsRequest) (fetchedGraph, fetchedGraph, error) {
+func (c *controller) fetchTargetGraphs(ctx context.Context, e *metrics.Emitter, logger *zap.Logger, request *pb.GetChangedTargetsRequest, treehash1, treehash2 string) (fetchedGraph, fetchedGraph, error) {
 	jobs := make([]*job, 2)
 	for i := 0; i < 2; i++ {
 		// create independent contexts for each job; if one of the jobs fails, the other one should be cancelled to save resources and improve latency
 		ctxNew, cancelNew := context.WithCancelCause(ctx)
 		defer cancelNew(nil)
-		jobs[i] = &job{ctx: ctxNew, cancel: cancelNew}
+		th := treehash1
+		if i == 1 {
+			th = treehash2
+		}
+		jobs[i] = &job{ctx: ctxNew, cancel: cancelNew, treehash: th}
 	}
 
 	// Start jobs for both revisions. Success or failure, the result will report to the results channel.
@@ -284,7 +299,7 @@ func (c *controller) fetchTargetGraphs(ctx context.Context, e *metrics.Emitter, 
 				ExcludeFilesRegex: request.GetRequestOptions().GetExtraExcludeFilesRegex(),
 				BypassCache:       request.GetBypassCache(),
 			}
-			graphReader, err := c.getGraph(jobs[idx].ctx, e, entityReq)
+			graphReader, err := c.getGraph(jobs[idx].ctx, e, entityReq, jobs[idx].treehash)
 			if err != nil || graphReader == nil {
 				results <- graphResult{order: idx, err: err}
 				return
@@ -376,7 +391,7 @@ func (c *controller) fetchTargetGraphs(ctx context.Context, e *metrics.Emitter, 
 // a fire-and-forget goroutine so it does not block the stream send. The responses
 // is only read (never mutated) by the goroutine and the foreground send, so
 // concurrent access is safe; the caller must not mutate it. This is best effort.
-func (c *controller) cacheComparedTargets(logger *zap.Logger, request *pb.GetChangedTargetsRequest, responses []entity.GetChangedTargetsResponse) {
+func (c *controller) cacheComparedTargets(logger *zap.Logger, request *pb.GetChangedTargetsRequest, responses []entity.GetChangedTargetsResponse, treehash1, treehash2 string) {
 	go func() {
 		// Use c.appCtx directly: the cache write is fire-and-forget and must
 		// outlive the request (so a client disconnect doesn't abort it) but
@@ -385,17 +400,8 @@ func (c *controller) cacheComparedTargets(logger *zap.Logger, request *pb.GetCha
 		// is cancelled on shutdown. Per-operation deadlines are the storage
 		// backend's responsibility — the controller is backend-agnostic and
 		// must not encode any one implementation's I/O budget.
-		// The treehash reads here are for building the write key, not a cache
-		// serve attempt, so they pass a no-op emitter to avoid skewing the
-		// treehash cache hit rate.
-		treehash1, treehash2, err := readTreehashParallel(c.appCtx, c.storage, request.GetFirstRevision(), request.GetSecondRevision(), metrics.Nop(), opGetChangedTargets)
-		if err != nil {
-			// Goroutine outlives the handler so we can't return; log loudly and
-			// abandon the cache write. Surfacing infra failures matters more than
-			// a missed cache opportunity.
-			logger.Warn("GetChangedTargets: skipping cache write, failed to read revision treehash", zap.Error(err))
-			return
-		}
+		// The treehash values are passed by the caller (already read during
+		// the request) to avoid redundant storage reads.
 		if treehash1 != "" && treehash2 != "" {
 			cacheKey := cachekey.GetComparedTargetsCachePath(request.GetFirstRevision().GetRemote(), treehash1, treehash2, request.GetRequestOptions().GetExtraExcludeFilesRegex())
 			if writeErr := storage.WriteChangedTargetsStream(c.appCtx, c.storage, cacheKey, responses); writeErr != nil {
