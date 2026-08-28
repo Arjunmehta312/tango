@@ -129,6 +129,45 @@ func (r *treehashResolver) resolve(ctx context.Context, build *pb.BuildDescripti
 	return value, nil
 }
 
+// resolveParallel resolves both treehashes concurrently.
+// It memoizes successful reads; errors are not cached.
+// Returns (treehash1, treehash2, error).
+func (r *treehashResolver) resolveParallel(ctx context.Context, first, second *pb.BuildDescription) (string, string, error) {
+	type result struct {
+		idx  int
+		hash string
+		err  error
+	}
+
+	descs := [2]*pb.BuildDescription{first, second}
+	results := make(chan result, 2)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for i, desc := range descs {
+		go func(idx int, d *pb.BuildDescription) {
+			hash, err := r.resolve(ctx, d)
+			results <- result{idx: idx, hash: hash, err: err}
+		}(i, desc)
+	}
+
+	var hashes [2]string
+	var firstErr error
+	for range descs {
+		res := <-results
+		hashes[res.idx] = res.hash
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+			cancel()
+		}
+	}
+	if firstErr != nil {
+		return "", "", firstErr
+	}
+	return hashes[0], hashes[1], nil
+}
+
 // GetChangedTargets returns the changed targets between two revisions. If the
 // client disconnects, the stream's context is cancelled and the function
 // returns with context.Canceled.
@@ -168,14 +207,24 @@ func (c *controller) GetChangedTargets(request *pb.GetChangedTargetsRequest, str
 	// This avoids redundant storage reads across the request pipeline.
 	resolver := newTreehashResolver(c.storage, e, opGetChangedTargets)
 
-	// Fast path: stream a previously computed result straight from cache.
-	if !request.GetBypassCache() {
-		served, err := c.serveChangedTargetsFromCache(ctx, e, logger, request, stream, maxDist, start, resolver)
-		if err != nil {
-			return fmt.Errorf("serve from cache: %w", err)
-		}
-		if served {
-			return nil
+	// Read both treehashes concurrently to populate the resolver cache.
+	// This preserves the original concurrent behavior from readTreehashParallel.
+	treehash1, treehash2, err := resolver.resolveParallel(ctx, request.GetFirstRevision(), request.GetSecondRevision())
+	if err != nil {
+		return fmt.Errorf("read revision treehash: %w", err)
+	}
+	if treehash1 == "" || treehash2 == "" {
+		// One or both treehashes missing; skip cache and recompute.
+	} else {
+		// Fast path: stream a previously computed result straight from cache.
+		if !request.GetBypassCache() {
+			served, err := c.serveChangedTargetsFromCache(ctx, e, logger, request, stream, maxDist, start, resolver, treehash1, treehash2)
+			if err != nil {
+				return fmt.Errorf("serve from cache: %w", err)
+			}
+			if served {
+				return nil
+			}
 		}
 	}
 
@@ -218,16 +267,10 @@ func (c *controller) GetChangedTargets(request *pb.GetChangedTargetsRequest, str
 //   - (true, nil)  when a cached result was found and fully sent to the client;
 //   - (false, nil) on a cache miss or a corrupt blob — the caller should recompute;
 //   - (false, err) on an infra failure or a client disconnect that aborts the request.
-func (c *controller) serveChangedTargetsFromCache(ctx context.Context, e *metrics.Emitter, logger *zap.Logger, request *pb.GetChangedTargetsRequest, stream pb.TangoServiceGetChangedTargetsYARPCServer, maxDist int32, start time.Time, resolver *treehashResolver) (bool, error) {
+//
+// treehash1 and treehash2 are pre-resolved treehash values (may be empty if cache miss).
+func (c *controller) serveChangedTargetsFromCache(ctx context.Context, e *metrics.Emitter, logger *zap.Logger, request *pb.GetChangedTargetsRequest, stream pb.TangoServiceGetChangedTargetsYARPCServer, maxDist int32, start time.Time, resolver *treehashResolver, treehash1, treehash2 string) (bool, error) {
 	cacheStart := time.Now()
-	treehash1, err := resolver.resolve(ctx, request.GetFirstRevision())
-	if err != nil {
-		return false, fmt.Errorf("read revision treehash: %w", err)
-	}
-	treehash2, err := resolver.resolve(ctx, request.GetSecondRevision())
-	if err != nil {
-		return false, fmt.Errorf("read revision treehash: %w", err)
-	}
 	if treehash1 == "" || treehash2 == "" {
 		return false, nil
 	}

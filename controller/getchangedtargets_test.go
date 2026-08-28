@@ -359,11 +359,13 @@ func TestGetChangedTargets_TreehashReadError(t *testing.T) {
 	storagemock := storagemock.NewMockStorage(ctrl)
 	// A non-NotFound storage error on a treehash read must surface as a failed
 	// request rather than be silently treated as a cache miss. The resolver
-	// reads treehashes sequentially, so the first error is returned and the
-	// second read is not attempted.
+	// reads treehashes concurrently, so both reads are attempted; the first
+	// error is returned and the sibling is cancelled.
 	injected := errors.New("storage exploded")
+	// Both reads are attempted concurrently; one will fail and the other will be cancelled.
+	// The exact number of calls depends on scheduling, so we accept at least 1 call.
 	storagemock.EXPECT().Get(gomock.Any(), gomock.Any()).
-		Return(storage.DownloadResponse{}, injected).Times(1)
+		Return(storage.DownloadResponse{}, injected).MinTimes(1)
 
 	c := NewController(context.Background(), Params{
 		Logger:       zap.NewNop(),
@@ -1399,16 +1401,16 @@ func TestServeChangedTargetsFromCache(t *testing.T) {
 	t.Run("cache miss returns not-served, no error", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		st := storagemock.NewMockStorage(ctrl)
-		// Both treehash reads miss, so the cache path is skipped entirely.
+		// Cache miss for compared-targets, so the cache path is skipped entirely.
 		st.EXPECT().Get(gomock.Any(), gomock.Any()).
-			Return(storage.DownloadResponse{}, storage.NewNotFoundError("missing")).Times(2)
+			Return(storage.DownloadResponse{}, storage.NewNotFoundError("missing")).Times(1)
 
 		c := newTestController(zaptest.NewLogger(t))
 		c.storage = st
 		stream := tangomock.NewMockTangoServiceGetChangedTargetsYARPCServer(ctrl)
 		resolver := newTreehashResolver(c.storage, c.emitter, opGetChangedTargets)
 
-		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver)
+		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver, "treehash1", "treehash2")
 		require.NoError(t, err)
 		assert.False(t, served, "a cache miss must not be served")
 	})
@@ -1448,7 +1450,7 @@ func TestServeChangedTargetsFromCache(t *testing.T) {
 		resolver := newTreehashResolver(c.storage, c.emitter, opGetChangedTargets)
 		// No Send expectation: a corrupt blob must not send anything to the client.
 
-		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver)
+		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver, "", "")
 		require.NoError(t, err)
 		assert.False(t, served, "a corrupt blob must trigger recompute, not a partial send")
 	})
@@ -1483,7 +1485,7 @@ func TestServeChangedTargetsFromCache(t *testing.T) {
 		stream.EXPECT().Send(gomock.Any()).Return(nil).Times(2)
 		resolver := newTreehashResolver(c.storage, c.emitter, opGetChangedTargets)
 
-		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver)
+		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver, "treehash1", "treehash2")
 		require.NoError(t, err)
 		assert.True(t, served, "a clean cache hit must be served")
 	})
