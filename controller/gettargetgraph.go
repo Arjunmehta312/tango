@@ -56,7 +56,7 @@ func (c *controller) GetTargetGraph(request *pb.GetTargetGraphRequest, stream pb
 	if err != nil {
 		return tangoerrors.NewUser(fmt.Errorf("convert get target graph request: %w", err))
 	}
-	graphReader, err := c.getGraph(ctx, e, entityReq, "")
+	graphReader, err := c.getGraph(ctx, e, entityReq, nil, request.GetBuildDescription())
 	if err != nil {
 		return fmt.Errorf("get graph: %w", err)
 	}
@@ -96,18 +96,24 @@ func (c *controller) GetTargetGraph(request *pb.GetTargetGraphRequest, stream pb
 // entries store the full payload and stripping happens at send time, so
 // letting an orchestrator see it could poison the shared cache with
 // stripped graphs.
-// If treehash is provided (non-empty), it is used instead of reading from storage.
-func (c *controller) getGraph(ctx context.Context, e *metrics.Emitter, req entity.GetTargetGraphRequest, treehash string) (storage.GraphReader, error) {
+// If resolver is provided, it is used to resolve the treehash for the build description.
+func (c *controller) getGraph(ctx context.Context, e *metrics.Emitter, req entity.GetTargetGraphRequest, resolver *treehashResolver, revision *pb.BuildDescription) (storage.GraphReader, error) {
 	start := time.Now()
 	logger := c.logger.With(
 		zap.Any("build_description", req.Build),
 	)
 	if !req.BypassCache {
 		var treehashValue string
-		if treehash != "" {
-			// Use the pre-read treehash value passed by the caller.
-			treehashValue = treehash
-			logger.Debug("getGraph: using pre-read treehash")
+		if resolver != nil {
+			// Use the resolver to memoize treehash reads.
+			var err error
+			treehashValue, err = resolver.resolve(ctx, revision)
+			if err != nil {
+				return nil, fmt.Errorf("get treehash: %w", err)
+			}
+			if treehashValue != "" {
+				logger.Debug("getGraph: using pre-read treehash")
+			}
 		} else {
 			// Look up the git treehash based on cache path
 			treehashCachePath := cachekey.GetTreehashCachePath(req.Build)

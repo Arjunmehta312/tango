@@ -358,13 +358,12 @@ func TestGetChangedTargets_TreehashReadError(t *testing.T) {
 
 	storagemock := storagemock.NewMockStorage(ctrl)
 	// A non-NotFound storage error on a treehash read must surface as a failed
-	// request rather than be silently treated as a cache miss. Both revision
-	// treehashes are read in parallel, so two Get calls happen; the handler
-	// returns the first failure (and drops the cancelled sibling's error)
-	// before any graph fetch happens.
+	// request rather than be silently treated as a cache miss. The resolver
+	// reads treehashes sequentially, so the first error is returned and the
+	// second read is not attempted.
 	injected := errors.New("storage exploded")
 	storagemock.EXPECT().Get(gomock.Any(), gomock.Any()).
-		Return(storage.DownloadResponse{}, injected).Times(2)
+		Return(storage.DownloadResponse{}, injected).Times(1)
 
 	c := NewController(context.Background(), Params{
 		Logger:       zap.NewNop(),
@@ -1407,8 +1406,9 @@ func TestServeChangedTargetsFromCache(t *testing.T) {
 		c := newTestController(zaptest.NewLogger(t))
 		c.storage = st
 		stream := tangomock.NewMockTangoServiceGetChangedTargetsYARPCServer(ctrl)
+		resolver := newTreehashResolver(c.storage, c.emitter, opGetChangedTargets)
 
-		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), "", "")
+		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver)
 		require.NoError(t, err)
 		assert.False(t, served, "a cache miss must not be served")
 	})
@@ -1445,9 +1445,10 @@ func TestServeChangedTargetsFromCache(t *testing.T) {
 		c := newTestController(zaptest.NewLogger(t))
 		c.storage = st
 		stream := tangomock.NewMockTangoServiceGetChangedTargetsYARPCServer(ctrl)
+		resolver := newTreehashResolver(c.storage, c.emitter, opGetChangedTargets)
 		// No Send expectation: a corrupt blob must not send anything to the client.
 
-		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), "", "")
+		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver)
 		require.NoError(t, err)
 		assert.False(t, served, "a corrupt blob must trigger recompute, not a partial send")
 	})
@@ -1480,8 +1481,9 @@ func TestServeChangedTargetsFromCache(t *testing.T) {
 		c.storage = st
 		stream := tangomock.NewMockTangoServiceGetChangedTargetsYARPCServer(ctrl)
 		stream.EXPECT().Send(gomock.Any()).Return(nil).Times(2)
+		resolver := newTreehashResolver(c.storage, c.emitter, opGetChangedTargets)
 
-		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), "", "")
+		served, err := c.serveChangedTargetsFromCache(t.Context(), c.emitter, c.logger, changedTargetsRequest(), stream, -1, time.Now(), resolver)
 		require.NoError(t, err)
 		assert.True(t, served, "a clean cache hit must be served")
 	})
@@ -1507,8 +1509,9 @@ func TestFetchTargetGraphs(t *testing.T) {
 
 		c := newTestController(zaptest.NewLogger(t))
 		c.orchestrator = orch
+		resolver := newTreehashResolver(storage.NewMemoryStorage(), c.emitter, opGetChangedTargets)
 
-		first, second, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), "", "")
+		first, second, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), resolver)
 		require.NoError(t, err)
 		require.Len(t, first.chunks, 1)
 		require.Len(t, second.chunks, 1)
@@ -1531,8 +1534,9 @@ func TestFetchTargetGraphs(t *testing.T) {
 
 		c := newTestController(zaptest.NewLogger(t))
 		c.orchestrator = orch
+		resolver := newTreehashResolver(storage.NewMemoryStorage(), c.emitter, opGetChangedTargets)
 
-		first, second, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), "", "")
+		first, second, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), resolver)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, injected)
 		assert.Zero(t, first)
@@ -1552,8 +1556,9 @@ func TestFetchTargetGraphs(t *testing.T) {
 
 		c := newTestController(zaptest.NewLogger(t))
 		c.orchestrator = orch
+		resolver := newTreehashResolver(storage.NewMemoryStorage(), c.emitter, opGetChangedTargets)
 
-		_, _, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), "", "")
+		_, _, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), resolver)
 		require.Error(t, err)
 	})
 
@@ -1567,8 +1572,9 @@ func TestFetchTargetGraphs(t *testing.T) {
 
 		c := newTestController(zaptest.NewLogger(t))
 		c.orchestrator = orch
+		resolver := newTreehashResolver(storage.NewMemoryStorage(), c.emitter, opGetChangedTargets)
 
-		_, _, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), "", "")
+		_, _, err := c.fetchTargetGraphs(t.Context(), c.emitter, c.logger, bypassRequest(), resolver)
 		require.Error(t, err)
 	})
 }
